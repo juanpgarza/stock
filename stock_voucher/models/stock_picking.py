@@ -176,9 +176,9 @@ class StockPicking(models.Model):
                             move_line.product_uom._compute_quantity(
                                 move_line.quantity_done,
                                 order_line.product_uom)
-                    picking_value += (order_line.price_reduce_taxexcl *
+                    picking_value += (order_line.product_id.standard_price *
                                       so_product_qty)
-                    done_value += (order_line.price_reduce_taxexcl *
+                    done_value += (order_line.product_id.standard_price *
                                    so_qty_done)
                 elif rec.picking_type_id.pricelist_id:
                     pricelist = rec.picking_type_id.pricelist_id
@@ -219,14 +219,14 @@ class StockPicking(models.Model):
                                 move.product_uom_qty / bom_quantity))
                             done_avg.append((move.quantity_done / bom_quantity))
                         if len(picking_avg) == 0:
-                            picking_value += so_bom_line.price_reduce_taxexcl
+                            picking_value += so_bom_line.product_id.standard_price
                         else:
-                            picking_value += so_bom_line.price_reduce_taxexcl * (
+                            picking_value += so_bom_line.product_id.standard_price * (
                                 sum(picking_avg) / len(picking_avg))
                         if len(done_avg) == 0:
-                            done_value += so_bom_line.price_reduce_taxexcl
+                            done_value += so_bom_line.product_id.standard_price
                         else:
-                            done_value += so_bom_line.price_reduce_taxexcl * (
+                            done_value += so_bom_line.product_id.standard_price * (
                                 sum(done_avg) / len(done_avg))
 
             declared_value = picking_value if inmediate_transfer\
