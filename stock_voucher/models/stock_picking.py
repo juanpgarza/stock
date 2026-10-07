@@ -141,65 +141,79 @@ class StockPicking(models.Model):
         return res
 
     @api.depends(
-        'automatic_declare_value',
-        'move_lines.state',
-        'move_lines.quantity_done',
+            'automatic_declare_value',
+            'move_lines.state',
+            'move_lines.quantity_done',
         )
     def _compute_declared_value(self):
-        for rec in self.filtered(lambda p: p.automatic_declare_value and p.state not in ['done', 'cancel']):
+        for rec in self:
+            if not rec.automatic_declare_value or rec.state in ['done', 'cancel']:
+                rec.declared_value = 0.0
+                continue
+
             done_value = 0.0
             picking_value = 0.0
             inmediate_transfer = True
-            pricelist = False
             stock_bom_lines = self.env['stock.move']
-            for move_line in rec.move_lines.filtered(
-                    lambda x: x.state != 'cancel'):
+
+            for move_line in rec.move_lines.filtered(lambda x: x.state != 'cancel'):
                 order_line = move_line.sale_line_id
                 if move_line.quantity_done:
                     inmediate_transfer = False
+
                 if order_line:
-                    pricelist = rec.sale_id.pricelist_id
-                    # this should happends only if on SO it's a bom kit
-                    if not order_line.product_id == move_line.product_id:
+                    # Si es un kit en la SO
+                    if order_line.product_id != move_line.product_id:
                         stock_bom_lines |= move_line
                         continue
+
                     so_product_qty = move_line.product_uom_qty
                     so_qty_done = move_line.quantity_done
-                    # convert quantities if move line uom and sale line uom
-                    # are different
+
+                    # Conversión de UoM
                     if move_line.product_uom != order_line.product_uom:
-                        so_product_qty = \
-                            move_line.product_uom._compute_quantity(
-                                move_line.product_uom_qty,
-                                order_line.product_uom)
-                        so_qty_done = \
-                            move_line.product_uom._compute_quantity(
-                                move_line.quantity_done,
-                                order_line.product_uom)
-                    picking_value += (order_line.product_id.standard_price *
-                                      so_product_qty)
-                    done_value += (order_line.product_id.standard_price *
-                                   so_qty_done)
+                        so_product_qty = move_line.product_uom._compute_quantity(
+                            move_line.product_uom_qty, order_line.product_uom
+                        )
+                        so_qty_done = move_line.product_uom._compute_quantity(
+                            move_line.quantity_done, order_line.product_uom
+                        )
+
+                    # standard_price SIEMPRE está en la moneda de la compañía (company_id.currency_id)
+                    picking_value += order_line.product_id.standard_price * so_product_qty
+                    done_value += order_line.product_id.standard_price * so_qty_done
+
                 elif rec.picking_type_id.pricelist_id:
                     pricelist = rec.picking_type_id.pricelist_id
-                    price = rec.picking_type_id.pricelist_id.with_context(
-                        uom=move_line.product_uom.id).price_get(
+                    price = pricelist.with_context(
+                        uom=move_line.product_uom.id
+                    ).price_get(
                         move_line.product_id.id,
                         move_line.quantity_done or 1.0,
-                        partner=rec.partner_id.id)[
-                        rec.picking_type_id.pricelist_id.id]
-                    picking_value += (price * move_line.product_uom_qty)
-                    done_value += (price * move_line.quantity_done)
+                        partner=rec.partner_id.id,
+                    )[pricelist.id]
 
-            # This is for product in a kit (should only happen if sale_mrp ins
-            # installed). If it is bom we only compute amount if all bom
-            # components are deliverd (same as in bom _get_delivered_qty)
+                    # El precio de la pricelist está en pricelist.currency_id, lo convertimos a la moneda de la compañía
+                    date_order = rec.sale_id.date_order or fields.Date.today()
+                    price_company_currency = pricelist.currency_id._convert(
+                        price,
+                        rec.company_id.currency_id,
+                        rec.company_id,
+                        date_order,
+                    )
+
+                    picking_value += price_company_currency * move_line.product_uom_qty
+                    done_value += price_company_currency * move_line.quantity_done
+
+            # Lógica de Kits (BOM Phantom)
             bom_enable = 'bom_ids' in self.env['product.template']._fields
-            if bom_enable:
+            if bom_enable and stock_bom_lines:
                 for so_bom_line in stock_bom_lines.mapped('sale_line_id'):
                     bom = self.env['mrp.bom']._bom_find(
                         products=so_bom_line.product_id,
-                        company_id=so_bom_line.company_id.id)[so_bom_line.product_id]
+                        company_id=so_bom_line.company_id.id,
+                    ).get(so_bom_line.product_id)
+
                     if bom and bom.type == 'phantom':
                         bom_moves = so_bom_line.move_ids & stock_bom_lines
                         done_avg = []
@@ -207,34 +221,34 @@ class StockPicking(models.Model):
                         boms, lines = bom.sudo().explode(
                             so_bom_line.product_id,
                             so_bom_line.product_uom_qty,
-                            picking_type=bom.picking_type_id)
+                            picking_type=bom.picking_type_id,
+                        )
                         for move in bom_moves:
-                            bom_quantity = 0.0
-                            for bom_line, line_data in lines:
-                                if bom_line.product_id == move.product_id:
-                                    bom_quantity += line_data['qty']
+                            bom_quantity = sum(
+                                line_data['qty']
+                                for bom_line, line_data in lines
+                                if bom_line.product_id == move.product_id
+                            )
                             if not bom_quantity:
                                 continue
-                            picking_avg.append((
-                                move.product_uom_qty / bom_quantity))
-                            done_avg.append((move.quantity_done / bom_quantity))
-                        if len(picking_avg) == 0:
-                            picking_value += so_bom_line.product_id.standard_price
-                        else:
-                            picking_value += so_bom_line.product_id.standard_price * (
-                                sum(picking_avg) / len(picking_avg))
-                        if len(done_avg) == 0:
-                            done_value += so_bom_line.product_id.standard_price
-                        else:
-                            done_value += so_bom_line.product_id.standard_price * (
-                                sum(done_avg) / len(done_avg))
 
-            declared_value = picking_value if inmediate_transfer\
-                else done_value
-            if pricelist:
-                # we convert the declared_value to the currency of the company
-                rec.declared_value = pricelist.currency_id._convert(
-                    declared_value, rec.company_id.currency_id, rec.company_id,
-                    rec.sale_id.date_order or fields.Date.today())
-            else:
-                rec.declared_value = declared_value
+                            picking_avg.append(move.product_uom_qty / bom_quantity)
+                            done_avg.append(move.quantity_done / bom_quantity)
+
+                        unit_cost = so_bom_line.product_id.standard_price
+                        if not picking_avg:
+                            picking_value += unit_cost * so_bom_line.product_uom_qty
+                        else:
+                            picking_value += (unit_cost * so_bom_line.product_uom_qty) * (
+                                sum(picking_avg) / len(picking_avg)
+                            )
+
+                        if not done_avg:
+                            done_value += unit_cost * so_bom_line.product_uom_qty
+                        else:
+                            done_value += (unit_cost * so_bom_line.product_uom_qty) * (
+                                sum(done_avg) / len(done_avg)
+                            )
+
+            # Asignación final (ya todo está acumulado en la moneda de la compañía)
+            rec.declared_value = picking_value if inmediate_transfer else done_value
